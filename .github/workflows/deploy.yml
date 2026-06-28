@@ -15,15 +15,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Copy all repo files to the VM over SSH
+            # 2. Copy files to VM
       - name: Copy files to VM
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VM_IP }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "."               # everything in the repo root
+          source: "."
           target: "/var/www/todo-backend"
+          rm: true  # Remove target directory first
 
       # 3. SSH in, install deps, restart the app
       - name: Install & restart
