@@ -1,0 +1,45 @@
+name: Deploy Backend
+
+# Trigger: every push to main
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to Azure VM
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pull the code into the runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Copy all repo files to the VM over SSH
+      - name: Copy files to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_IP }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "."               # everything in the repo root
+          target: "/var/www/todo-backend"
+
+      # 3. SSH in, install deps, restart the app
+      - name: Install & restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_IP }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /var/www/todo-backend
+            npm ci --omit=dev
+            pm2 restart todo-backend || pm2 start src/index.js --name todo-backend
+            pm2 save
+
+      # 4. Quick health check — fails the workflow if the app didn't come up
+      - name: Health check
+        run: |
+          sleep 5
+          curl --fail http://${{ secrets.VM_IP }}/health
