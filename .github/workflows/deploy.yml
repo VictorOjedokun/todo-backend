@@ -3,7 +3,7 @@ name: Deploy Backend
 # Trigger: every push to main
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   deploy:
