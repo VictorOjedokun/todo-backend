@@ -1,0 +1,293 @@
+# Deploying a Two-Repo App to Two GCP VMs (Backend + Frontend) with CI/CD
+
+This is a real walkthrough of deploying a Node.js/Express backend and a Create React App frontend to two separate GCP VMs, connected to each other, with GitHub Actions handling automatic deployments on every push. It includes the actual mistakes made along the way and how they were fixed — debugging is part of the job, not a sign something went wrong.
+
+## Architecture
+
+```
+GitHub (todo-backend repo)  ──push──▶  GitHub Actions  ──SSH──▶  Backend VM (Nginx → PM2 → Express, port 80 → 3000)
+GitHub (todo-frontend repo) ──push──▶  GitHub Actions  ──SSH──▶  Frontend VM (Nginx → PM2 → serve, port 80 → 3001)
+
+Frontend VM (browser) ──fetch──▶ Backend VM, over the public internet, via REACT_APP_API_URL
+```
+
+Two completely separate VMs, two separate repos, two separate pipelines. The frontend talks to the backend the same way any browser would — over HTTP, using the backend's public IP.
+
+## Step 1: Run `npm install` in Each Repo Locally
+
+Before anything touches a VM, make sure each repo (backend and frontend) has a working, committed lockfile. On your own machine, inside each repo's root folder:
+
+```bash
+npm install
+```
+
+This generates/updates `package-lock.json`. Commit and push it:
+
+```bash
+git add package-lock.json
+git commit -m "Add package-lock.json"
+git push
+```
+
+This matters because the provisioning script and CI/CD pipeline both use `npm ci`, which requires a lockfile to already exist — it will not generate one for you. Skipping this step is the single most common reason a deploy fails on the very first run (see Mistake 3 at the bottom).
+
+While you're here, also check your `.gitignore` includes `node_modules/` — you never want to commit that folder (see Mistake 5).
+
+## Step 2: Set Up the CI/CD Pipeline (GitHub Actions)
+
+Add the deploy workflow file to each repo at `.github/workflows/deploy.yml` — one file per repo (`backend-deploy.yml` content goes in the backend repo, `frontend-deploy.yml` content goes in the frontend repo).
+
+### How it works
+
+1. Code is pushed to GitHub
+2. GitHub Actions checks out the code and runs it through a build/test step on GitHub's own servers
+3. If that succeeds, GitHub Actions opens an SSH connection to the VM
+4. On the VM, it pulls the latest code, reinstalls dependencies, rebuilds, and restarts the app under PM2
+
+### Key pipeline behavior worth understanding
+
+The deploy step uses `git reset --hard origin/<branch>` rather than `git pull`, which guarantees the VM always matches GitHub exactly — discarding any local changes accidentally made directly on the VM. This is intentional: the VM should never be the source of truth, GitHub should be.
+
+The PM2 restart uses `pm2 reload <name> --update-env || pm2 start ecosystem.config.js` — `reload` does a zero-downtime restart if the process already exists, and the `||` fallback handles the very first deploy when no process exists yet.
+
+The pipeline won't actually succeed yet at this point — it needs the VM to exist and the GitHub Secrets to be filled in first. That's fine; setting it up now just means it's ready to fire the moment those pieces are in place.
+
+## Step 3: Create the VMs and Connect via SSH
+
+Spin up two VMs (one for backend, one for frontend) on your cloud provider (GCP or Azure both work the same way at the OS level — see Mistake 2 below). Note the public IP address of each VM, since you'll need it in several places later.
+
+SSH into each VM to confirm access before doing anything else:
+
+```bash
+ssh <your-username>@<vm-public-ip>
+```
+
+If this connects successfully, you're ready to provision. If it doesn't, fix that first — nothing else in this guide will work without SSH access.
+
+## Step 4: Run the Provisioning Script
+
+Copy `provision-backend.sh` onto the backend VM and `provision-frontend.sh` onto the frontend VM (e.g. via `scp`, or by creating the file directly on the VM and pasting the contents in).
+
+### Where to edit the scripts before running them
+
+Both scripts have a config block near the top — **this is the only part you should need to change**:
+
+```bash
+# ---------- Config — edit these before running ----------
+APP_USER="your-vm-username"
+APP_DIR="/var/www/backend"          # or /var/www/frontend
+REPO_URL="https://github.com/YOUR_ORG/YOUR_REPO.git"
+REPO_BRANCH="main"                  # or master, check your repo
+APP_PORT=3000                       # 3001 for frontend
+NGINX_SERVER_NAME="your-vm-ip"
+NODE_VERSION="20"
+# --------------------------------------------------------
+```
+
+The frontend script has one extra variable, `BACKEND_API_URL`, which should point at the backend VM's IP **including the `/api` prefix** if your backend routes are mounted under `/api` (see Mistake 8) — e.g. `http://34.35.151.43/api`.
+
+Once edited, run each script with `sudo` (it needs root to install packages, configure Nginx, and set up the firewall):
+
+```bash
+sudo bash provision-backend.sh
+```
+
+```bash
+sudo bash provision-frontend.sh
+```
+
+### What the script does, step by step
+
+1. Updates the system and installs `git`, `nginx`, `build-essential`, `ufw`
+2. Installs Node.js (via NodeSource) and PM2 (a process manager that keeps your app running and restarts it if it crashes)
+3. Clones the repo into `/var/www/backend` or `/var/www/frontend`
+4. Installs dependencies and builds the app
+5. Starts the app under PM2, configured to launch automatically on VM reboot
+6. Configures Nginx as a reverse proxy, so the app (running on an internal port like 3000) is reachable on the standard web port 80
+7. Opens the firewall for SSH and HTTP traffic
+
+### Design decision: one user for everything
+
+Rather than creating a separate `deploy` system user, we used the VM's existing login user (the one you SSH in as) for provisioning, running the app, and CI/CD deployments. Fewer moving parts, fewer permission mismatches — at the cost of your personal SSH access and the CI/CD pipeline sharing the same level of access. For a class project or small team this tradeoff is fine; for production systems handling sensitive data, a dedicated low-privilege deploy user is the safer pattern.
+
+## Step 5: Add GitHub Secrets
+
+Back in each repo on GitHub, go to **Settings → Secrets and variables → Actions** and add the secrets the pipeline needs. Never hardcode these values into the workflow file itself.
+
+**Backend repo:**
+
+| Secret | What it is |
+|---|---|
+| `BACKEND_VM_HOST` | The backend VM's public IP |
+| `BACKEND_VM_USER` | The SSH username on the VM |
+| `BACKEND_VM_SSH_KEY` | A private SSH key that can log into that user on the VM |
+
+**Frontend repo:**
+
+| Secret | What it is |
+|---|---|
+| `FRONTEND_VM_HOST` | The frontend VM's public IP |
+| `FRONTEND_VM_USER` | The SSH username on the VM |
+| `FRONTEND_VM_SSH_KEY` | A private SSH key that can log into that user on the VM |
+| `REACT_APP_API_URL` | The backend's URL, baked into the frontend build (include `/api` if your backend routes use that prefix) |
+
+Once these are filled in, push any commit to trigger the pipeline — from this point forward, every push redeploys automatically.
+
+## Quick Reference: Debugging Checklist
+
+When something doesn't work after a deploy, check in this order:
+
+1. **Did the pipeline actually finish?** Check the Actions tab in GitHub — a stuck or failed step tells you whether the problem is in the build or the deploy.
+2. **Is the process running?** SSH in and run `pm2 list` and `pm2 logs <name>`.
+3. **Is Nginx configured correctly?** `sudo nginx -t` checks syntax; `sudo systemctl status nginx` checks it's running.
+4. **Is the request even reaching the server?** Check the browser's Network tab — a connection error, CORS error, and 404 are three completely different problems requiring three different fixes.
+5. **Does the route actually exist on the backend?** `grep` your backend's route definitions and compare them character-for-character against what the frontend is calling.
+
+## Mistakes We Actually Hit (and the fixes)
+
+### Mistake 1: `google-cloud-cli` hanging the provisioning script
+
+**Symptom:** the script froze indefinitely during `apt-get upgrade`, stuck on `Setting up google-cloud-cli`.
+
+**Why:** GCP's default Ubuntu images ship with the Google Cloud CLI pre-installed via its own apt repository. Its post-install script tries to configure shell completions and sometimes hangs waiting on input that never arrives in a non-interactive script.
+
+**Fix:** disable the Google Cloud apt repo and remove the package *before* running any upgrade, plus set `DEBIAN_FRONTEND=noninteractive` so apt never waits on a prompt in the first place:
+
+```bash
+export DEBIAN_FRONTEND=noninteractive
+
+if [ -f /etc/apt/sources.list.d/google-cloud-sdk.list ]; then
+  mv /etc/apt/sources.list.d/google-cloud-sdk.list /etc/apt/sources.list.d/google-cloud-sdk.list.disabled
+fi
+apt-get remove --purge -y google-cloud-cli
+apt-mark hold google-cloud-cli
+```
+
+**Lesson:** cloud provider VM images often come with extra vendor tooling pre-installed. If a script hangs with no error, check what's actually running (`ps aux`) before assuming your code is broken.
+
+### Mistake 2: assuming the wrong cloud provider
+
+The original scripts were written assuming Azure (`azureuser` as the default username, "Azure VM" in comments). The actual deployment target was GCP. The fix was just updating the username variable and removing Azure-specific wording — the rest of the script (apt, Node, PM2, Nginx) is identical across cloud providers, since it's all just Ubuntu underneath.
+
+**Lesson:** the OS-level setup (Linux, Nginx, Node, PM2) doesn't care which cloud you're on. What differs between providers is the firewall layer, the metadata/login setup, and pre-installed vendor tooling — not the application stack itself.
+
+### Mistake 3: `npm ci` failing — no lockfile
+
+**Symptom:**
+```
+npm error The `npm ci` command can only install with an existing package-lock.json
+```
+
+**Why:** `npm ci` (used for fast, reproducible installs in CI/CD and deployment scripts) requires a `package-lock.json` already committed to the repo. It will not generate one — that's `npm install`'s job.
+
+**Fix:** run `npm install` locally once to generate the lockfile, then commit and push it:
+```bash
+npm install
+git add package-lock.json
+git commit -m "Add package-lock.json"
+git push
+```
+
+**Lesson:** always commit your lockfile. It's not optional for any project using `npm ci` in CI/CD — without it, every clean install becomes non-reproducible and CI breaks.
+
+### Mistake 4: lockfile and package.json disagreeing on a dependency version
+
+**Symptom:**
+```
+npm error Invalid: lock file's typescript@6.0.3 does not satisfy typescript@4.9.5
+```
+
+**Why:** the lockfile had drifted out of sync with `package.json` — likely generated at a different time with a different version installed.
+
+**Fix:** run `npm install` (not `ci`) to let npm reconcile the two files, then commit the corrected lockfile:
+```bash
+npm install
+git add package-lock.json
+git commit -m "Fix dependency version mismatch in lockfile"
+git push
+```
+
+**Lesson:** `npm ci` is intentionally strict — it will refuse to "helpfully" guess what you meant. That strictness is the entire point: it guarantees what gets installed in CI/CD exactly matches what's locked, with zero surprises.
+
+### Mistake 5: accidentally committing `node_modules`
+
+**Symptom:** a `git clone` that should take a few seconds was pulling down 36 MiB and 31,000+ files.
+
+**Why:** `node_modules` wasn't in `.gitignore`, so it got committed alongside actual source code.
+
+**Fix:**
+```bash
+echo "node_modules/" >> .gitignore
+git rm -r --cached node_modules
+git add .gitignore
+git commit -m "Stop tracking node_modules"
+git push
+```
+
+**Lesson:** `node_modules` should never be committed. It's fully regenerated from `package-lock.json` by `npm ci`, and committing it bloats your repo, slows every clone, and risks platform-specific binaries breaking on a different OS.
+
+### Mistake 6: wrong framework assumptions — Next.js vs Create React App
+
+**Symptom:**
+```
+[PM2][ERROR] Error: Script not found: /var/www/frontend/node_modules/.bin/next
+```
+
+**Why:** the provisioning script was written assuming a Next.js app (`next start` as the run command), but the actual project was a Create React App (CRA) project. CRA doesn't run a Node server in production — it builds static HTML/CSS/JS files that need to be *served*, not *executed*.
+
+**Fix:** changed the PM2 process to run the `serve` package against the static build output instead of trying to run a Next.js server:
+```js
+// ecosystem.config.js
+module.exports = {
+  apps: [{
+    name: 'frontend',
+    script: '/usr/bin/serve',
+    args: '-s build -l 3001',
+    cwd: '/var/www/frontend',
+  }]
+};
+```
+Also changed the environment variable prefix from `NEXT_PUBLIC_` (Next.js convention) to `REACT_APP_` (CRA convention) — each framework only exposes env vars to the browser bundle if they use its specific prefix.
+
+**Lesson:** know your framework's production model before writing deployment scripts. Next.js needs a running Node server; CRA, Vite, and most other "build tool" frontends just need static files served by something like Nginx, `serve`, or any static file host.
+
+### Mistake 7: build process running out of memory
+
+**Symptom:** the CI/CD pipeline's deploy step hung for 6+ minutes with no progress.
+
+**Why:** the frontend VM was an `e2-micro` instance with under 1 GB of RAM and no swap space. Building a CRA app (`npm run build`) is memory-intensive — the Webpack compilation process alone can need 1–1.5 GB+. With almost no free memory and no swap, the build was thrashing, not actually hung.
+
+**Diagnosis:**
+```bash
+free -h
+# Mem: 964Mi total, 921Mi used, 71Mi free  <- the smoking gun
+```
+
+**Fix:** added a swap file to give the OS breathing room during memory-intensive operations:
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+**Lesson:** small/cheap cloud VMs are fine for serving traffic but can genuinely struggle to *build* modern JavaScript projects. Either size the VM appropriately, add swap as a safety net, or build the app elsewhere (like in GitHub Actions itself) and only deploy the finished static files to a small VM.
+
+### Mistake 8: frontend reaching the backend but hitting 404
+
+**Symptom:** the app loaded fine, but showed "Cannot reach the backend," and the browser's Network tab showed a clean `404 Not Found` (not a timeout, not CORS, not a connection error) for a request to `http://<backend-ip>/todos`.
+
+**Why:** the backend's actual Express routes were all defined under an `/api` prefix:
+```js
+app.get("/api/todos", ...)
+app.post("/api/todos", ...)
+```
+But the frontend's `REACT_APP_API_URL` environment variable was just the bare host (`http://<backend-ip>`), and the frontend code appended `/todos` directly — missing the `/api` prefix entirely.
+
+**Fix:** updated the `REACT_APP_API_URL` GitHub secret to include the `/api` prefix:
+```
+REACT_APP_API_URL=http://<backend-ip>/api
+```
+
+**Lesson:** a 404 with a successful connection is a routing mismatch, not an infrastructure problem. Always check three things separately when a frontend can't "reach" a backend: (1) is the network connection even succeeding (check for CORS errors or connection refused vs an actual HTTP status code), (2) is the URL path correct, (3) does the backend route actually exist at that path. The browser's Network tab tells you which of these three you're dealing with.
